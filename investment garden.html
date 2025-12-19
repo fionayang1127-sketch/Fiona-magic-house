@@ -1,44 +1,757 @@
 
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Investment Garden - 投资花园</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=ZCOOL+XiaoWei&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
-    <style>
-        body {
-            font-family: 'Noto+Sans+SC', sans-serif;
-            background-color: #fffafb;
-        }
-        .font-game {
-            font-family: 'ZCOOL XiaoWei', serif;
-        }
-        ::-webkit-scrollbar {
-            width: 8px;
-        }
-        ::-webkit-scrollbar-track {
-            background: #fff5f7;
-        }
-        ::-webkit-scrollbar-thumb {
-            background: #ffd1dc;
-            border-radius: 10px;
-        }
-    </style>
-<script type="importmap">
-{
-  "imports": {
-    "@google/genai": "https://esm.sh/@google/genai@^1.34.0",
-    "react/": "https://esm.sh/react@^19.2.3/",
-    "react": "https://esm.sh/react@^19.2.3",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
-    "lucide-react": "https://esm.sh/lucide-react@^0.562.0"
-  }
-}
-</script>
-</head>
-<body>
-    <div id="root"></div>
-</body>
-</html>
+import React, { useState, useEffect, useMemo } from 'react';
+import { InvestmentPlan, PlanStatus, ConvictionLevel, MainVariable, StrategyStep } from './types';
+import { analyzeTrade, getGeneralAdvice, critiqueStrategy } from './geminiService';
+import { 
+  Plus, Sword, Shield, History, BarChart3, 
+  MessageCircle, Sparkles, Trash2, ChevronRight, 
+  Brain, Target, Zap, 
+  Fingerprint,
+  Link as LinkIcon, TrendingUp, TrendingDown,
+  ShieldAlert, Scale, Layers, X, Info, CheckCircle2,
+  Gamepad2
+} from 'lucide-react';
+
+// --- Constants & Templates ---
+
+const HYPOTHESIS_TEMPLATES = [
+  { name: '趋势突破', text: '价格放量突破[关键压力位]，属于右侧确认信号，预期趋势延续。' },
+  { name: '均线支撑', text: '价格回调至[XX日]均线附近，且缩量企稳，博弈均线支撑的有效性。' },
+  { name: '基本面错杀', text: '基本面无恶化，但受市场情绪拖累跌至[估值低位]，预期价值回归。' },
+  { name: '财报博弈', text: '预期财报表现将优于市场共识，在消息发布前提前布局埋伏。' }
+];
+
+const RR_TEMPLATES = ['1:1.5 (高胜率)', '1:2 (平衡型)', '1:3 (标准盈亏比)', '1:5 (趋势博弈)'];
+
+const EXIT_LOGIC_TEMPLATES = {
+  sl: ['前低支撑位', 'MA20线', '跌幅5%', '筹码密集区下沿'],
+  tp: ['前高阻力位', '涨幅15%', '通道上轨', '心理整数关口']
+};
+
+// --- Styled Components ---
+
+const GlassCard = ({ children, className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div 
+    {...props}
+    className={`bg-white/80 backdrop-blur-md rounded-[2.5rem] p-6 border border-white shadow-[0_10px_40px_rgba(255,182,193,0.15)] ${className}`}
+  >
+    {children}
+  </div>
+);
+
+const PrimaryButton = ({ onClick, children, disabled = false, className = "" }: any) => (
+  <button 
+    onClick={onClick} 
+    disabled={disabled}
+    className={`bg-gradient-to-r from-pink-300 to-rose-300 text-white font-bold py-4 px-8 rounded-2xl shadow-lg active:scale-95 transition-all disabled:opacity-50 ${className}`}
+  >
+    {children}
+  </button>
+);
+
+const StepLabel = ({ num, text, icon: Icon }: { num: number, text: string, icon: any }) => (
+  <div className="flex items-center gap-3 mb-6">
+    <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-pink-100 to-blue-50 text-pink-400 flex items-center justify-center font-bold shadow-sm">
+      <Icon size={20} />
+    </div>
+    <div>
+      <p className="text-[10px] font-bold text-gray-300 uppercase tracking-widest">Phase {num}</p>
+      <p className="font-bold text-gray-700">{text}</p>
+    </div>
+  </div>
+);
+
+const TemplateChip = ({ label, onClick, active = false }: any) => (
+  <button
+    onClick={onClick}
+    className={`px-3 py-1.5 rounded-xl text-[10px] font-bold transition-all border ${
+      active 
+        ? 'bg-rose-100 border-rose-200 text-rose-500' 
+        : 'bg-white border-slate-100 text-slate-400 hover:border-rose-100'
+    }`}
+  >
+    {label}
+  </button>
+);
+
+const TradeSparkline = ({ pnl, maxProfit, maxDrawdown }: { pnl: number, maxProfit?: number, maxDrawdown?: number }) => {
+  const points = useMemo(() => {
+    const p = [0];
+    if (maxDrawdown !== undefined) p.push(maxDrawdown);
+    if (maxProfit !== undefined) p.push(maxProfit);
+    p.push(pnl);
+    
+    if (p.length === 2) {
+      p.splice(1, 0, pnl * 0.4, pnl * 1.2);
+    }
+
+    const min = Math.min(...p, -5);
+    const max = Math.max(...p, 5);
+    const range = max - min;
+    
+    return p.map((val, i) => ({
+      x: (i / (p.length - 1)) * 100,
+      y: 100 - ((val - min) / range) * 80 - 10 
+    }));
+  }, [pnl, maxProfit, maxDrawdown]);
+
+  const pathData = `M ${points.map(p => `${p.x},${p.y}`).join(' L ')}`;
+  const color = pnl >= 0 ? '#10b981' : '#f43f5e';
+
+  return (
+    <div className="w-full h-16 relative">
+      <svg viewBox="0 0 100 100" className="w-full h-full overflow-visible" preserveAspectRatio="none">
+        <line x1="0" y1="50" x2="100" y2="50" stroke="#f1f5f9" strokeWidth="1" strokeDasharray="4" />
+        <path
+          d={pathData}
+          fill="none"
+          stroke={color}
+          strokeWidth="3"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="drop-shadow-sm"
+        />
+        <circle cx="100" cy={points[points.length-1].y} r="3" fill={color} />
+      </svg>
+    </div>
+  );
+};
+
+// --- Main App ---
+
+export default function App() {
+  const [plans, setPlans] = useState<InvestmentPlan[]>([]);
+  const [view, setView] = useState<'home' | 'forge' | 'battle' | 'review' | 'archive' | 'mentor'>('home');
+  const [currentStep, setCurrentStep] = useState(1);
+  const [selectedPlan, setSelectedPlan] = useState<InvestmentPlan | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [showForgeOnboarding, setShowForgeOnboarding] = useState(false);
+  
+  const [critique, setCritique] = useState('');
+  const [isCritiquing, setIsCritiquing] = useState(false);
+
+  const [mentorQuestion, setMentorQuestion] = useState('');
+  const [mentorAnswer, setMentorAnswer] = useState('');
+  const [isAskingMentor, setIsAskingMentor] = useState(false);
+
+  const [forgeData, setForgeData] = useState<Partial<InvestmentPlan>>({
+    title: '', ticker: '', variable: MainVariable.TECHNICAL, level: ConvictionLevel.LIGHT,
+    hypothesis: '', riskRewardRatio: '1:3', psychology: 5,
+    entrySteps: [{ price: '', position: '100', action: '市价买入' }],
+    stopLossPrice: '', takeProfitPrice: '', timeLimit: '2周'
+  });
+
+  const [reviewData, setReviewData] = useState({ 
+    pnl: 0, 
+    exitPrice: '', 
+    notes: '', 
+    discipline: 80,
+    maxProfit: 0,
+    maxDrawdown: 0
+  });
+
+  useEffect(() => {
+    const saved = localStorage.getItem('garden_plans');
+    if (saved) setPlans(JSON.parse(saved));
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('garden_plans', JSON.stringify(plans));
+  }, [plans]);
+
+  const startForge = () => {
+    const onboarded = localStorage.getItem('garden_forge_onboarded');
+    if (!onboarded) {
+      setShowForgeOnboarding(true);
+    }
+    setForgeData({
+      title: '', ticker: '', variable: MainVariable.TECHNICAL, level: ConvictionLevel.LIGHT,
+      hypothesis: '', riskRewardRatio: '1:3', psychology: 5,
+      entrySteps: [{ price: '', position: '100', action: '市价买入' }],
+      stopLossPrice: '', takeProfitPrice: '', timeLimit: '2周'
+    });
+    setCritique('');
+    setCurrentStep(1);
+    setView('forge');
+  };
+
+  const closeOnboarding = () => {
+    setShowForgeOnboarding(false);
+    localStorage.setItem('garden_forge_onboarded', 'true');
+  };
+
+  const handleCritique = async () => {
+    if (!forgeData.hypothesis) return;
+    setIsCritiquing(true);
+    const result = await critiqueStrategy(forgeData);
+    setCritique(result);
+    setIsCritiquing(false);
+  };
+
+  const savePlan = () => {
+    const newPlan: InvestmentPlan = {
+      ...(forgeData as InvestmentPlan),
+      id: Date.now().toString(),
+      createdAt: Date.now(),
+      status: PlanStatus.ACTIVE
+    };
+    setPlans([newPlan, ...plans]);
+    setView('home');
+  };
+
+  const finishTrade = async () => {
+    if (!selectedPlan) return;
+    setIsProcessing(true);
+    const updated = {
+      ...selectedPlan,
+      status: PlanStatus.COMPLETED,
+      pnl: reviewData.pnl,
+      exitPrice: reviewData.exitPrice,
+      maxProfit: reviewData.maxProfit,
+      maxDrawdown: reviewData.maxDrawdown,
+      reviewNotes: reviewData.notes,
+      disciplineScore: reviewData.discipline
+    };
+    const analysis = await analyzeTrade(updated);
+    updated.aiAnalysis = analysis;
+    setPlans(plans.map(p => p.id === updated.id ? updated : p));
+    setIsProcessing(false);
+    setView('archive');
+  };
+
+  const askMentor = async () => {
+    if (!mentorQuestion.trim()) return;
+    setIsAskingMentor(true);
+    const historySummary = plans
+      .filter(p => p.status === PlanStatus.COMPLETED)
+      .slice(0, 10)
+      .map(p => `${p.ticker}: 盈亏${p.pnl}%, 纪律${p.disciplineScore}分`)
+      .join('; ');
+
+    const advice = await getGeneralAdvice(mentorQuestion, historySummary || "尚无历史成交记录，请根据通用逻辑指导。");
+    setMentorAnswer(advice);
+    setIsAskingMentor(false);
+  };
+
+  const addEntryStep = () => {
+    const steps = [...(forgeData.entrySteps || [])];
+    steps.push({ price: '', position: '0', action: '限价买入' });
+    setForgeData({ ...forgeData, entrySteps: steps });
+  };
+
+  const removeEntryStep = (index: number) => {
+    const steps = [...(forgeData.entrySteps || [])];
+    if (steps.length <= 1) return;
+    steps.splice(index, 1);
+    setForgeData({ ...forgeData, entrySteps: steps });
+  };
+
+  const updateEntryStep = (index: number, field: keyof StrategyStep, value: string) => {
+    const steps = [...(forgeData.entrySteps || [])];
+    steps[index] = { ...steps[index], [field]: value };
+    setForgeData({ ...forgeData, entrySteps: steps });
+  };
+
+  const activePlans = plans.filter(p => p.status === PlanStatus.ACTIVE);
+  const historyPlans = plans.filter(p => p.status === PlanStatus.COMPLETED);
+
+  return (
+    <div className="min-h-screen bg-[#fffcfd] pb-24 font-sans selection:bg-pink-100 text-slate-800">
+      <nav className="p-6 flex justify-between items-center">
+        <div className="flex items-center gap-2">
+          <div className="w-10 h-10 bg-gradient-to-tr from-pink-300 to-rose-200 rounded-2xl flex items-center justify-center shadow-md">
+            <Fingerprint className="text-white" size={20} />
+          </div>
+          <div className="flex flex-col">
+            <span className="text-lg font-game font-bold text-rose-400 leading-tight">InvestGarden</span>
+            <span className="text-[8px] font-bold text-slate-300 tracking-widest uppercase">Powered by Google Gemini</span>
+          </div>
+        </div>
+        <button onClick={() => setView('mentor')} className="w-10 h-10 bg-white rounded-full shadow-sm flex items-center justify-center text-blue-300 hover:text-blue-400 transition-colors">
+          <Brain size={22} />
+        </button>
+      </nav>
+
+      <main className="max-w-xl mx-auto px-4">
+        {/* Onboarding Overlay */}
+        {showForgeOnboarding && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-slate-900/40 backdrop-blur-sm animate-in fade-in duration-300">
+            <GlassCard className="max-w-sm w-full border-pink-200 animate-in zoom-in-95 duration-300 shadow-2xl">
+              <div className="flex flex-col items-center text-center">
+                <div className="w-16 h-16 bg-rose-100 rounded-[1.5rem] flex items-center justify-center text-rose-500 mb-6">
+                  <Gamepad2 size={32} />
+                </div>
+                <h3 className="text-xl font-game font-bold text-slate-800 mb-2">老兵开班：锻造的艺术</h3>
+                <p className="text-xs text-slate-400 mb-6">在进入战场前，你需要明白为什么要制定这些规则：</p>
+                
+                <div className="space-y-4 text-left w-full mb-8">
+                  <div className="flex gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center shrink-0"><Zap size={14} className="text-blue-400"/></div>
+                    <div>
+                      <p className="text-[11px] font-bold text-slate-700">核心假设：买入的“灵魂”</p>
+                      <p className="text-[10px] text-slate-400">没有假设就是赌博。它解释了为什么你会赚钱，也是你认错的依据。</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-emerald-50 flex items-center justify-center shrink-0"><Scale size={14} className="text-emerald-400"/></div>
+                    <div>
+                      <p className="text-[11px] font-bold text-slate-700">风险报酬比：盈利的“数学基础”</p>
+                      <p className="text-[10px] text-slate-400">亏1块钱去赚3块钱。只要盈亏比够大，你的胜率哪怕只有40%也是赢家。</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-amber-50 flex items-center justify-center shrink-0"><Target size={14} className="text-amber-400"/></div>
+                    <div>
+                      <p className="text-[11px] font-bold text-slate-700">信心等级：仓位的“油门”</p>
+                      <p className="text-[10px] text-slate-400">信心不是主观愿望，而是你手头证据的数量。证据越多，油门越重。</p>
+                    </div>
+                  </div>
+                </div>
+                
+                <PrimaryButton onClick={closeOnboarding} className="w-full">
+                  我已参透，开始锻造
+                </PrimaryButton>
+              </div>
+            </GlassCard>
+          </div>
+        )}
+
+        {view === 'home' && (
+          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <GlassCard className="py-5 bg-gradient-to-r from-pink-50/50 to-blue-50/50">
+              <div className="flex items-center gap-3 mb-4">
+                <ShieldAlert className="text-pink-400" size={20} />
+                <h3 className="text-sm font-bold text-slate-600">老兵决策看板</h3>
+              </div>
+              <div className="grid grid-cols-3 gap-4">
+                <div className="text-center">
+                  <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">活跃逻辑</p>
+                  <p className="text-xl font-bold text-rose-400">{activePlans.length}</p>
+                </div>
+                <div className="text-center border-x border-slate-100">
+                  <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">平均纪律</p>
+                  <p className="text-xl font-bold text-blue-400">
+                    {historyPlans.length > 0 ? (historyPlans.reduce((acc, p) => acc + (p.disciplineScore || 0), 0) / historyPlans.length).toFixed(0) : '--'}
+                  </p>
+                </div>
+                <div className="text-center">
+                  <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">XP 等级</p>
+                  <p className="text-xl font-bold text-emerald-400">LV.{Math.floor(historyPlans.length / 5) + 1}</p>
+                </div>
+              </div>
+            </GlassCard>
+
+            <section>
+              <div className="flex justify-between items-center mb-4 px-2">
+                <h2 className="font-bold text-slate-600 flex items-center gap-2"><Sword size={18} className="text-rose-400" /> 当前战斗席位</h2>
+              </div>
+              {activePlans.length === 0 ? (
+                <div className="text-center py-16 bg-white/40 border-2 border-dashed border-pink-100 rounded-[3rem]">
+                  <p className="text-slate-400 text-sm mb-6 px-10 leading-relaxed">
+                    “空仓也是一种战斗。如果没有值得博弈的逻辑，就待在休息室里。”
+                  </p>
+                  <PrimaryButton onClick={startForge}>锻造新决策</PrimaryButton>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {activePlans.map(plan => (
+                    <GlassCard key={plan.id} className="hover:scale-[1.02] transition-transform cursor-pointer group" onClick={() => { setSelectedPlan(plan); setView('battle'); }}>
+                      <div className="flex justify-between items-start">
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className={`text-[8px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider ${
+                               plan.variable === MainVariable.TECHNICAL ? 'bg-blue-50 text-blue-500' :
+                               plan.variable === MainVariable.FUNDAMENTAL ? 'bg-emerald-50 text-emerald-500' :
+                               'bg-purple-50 text-purple-500'
+                            }`}>
+                              {plan.variable}
+                            </span>
+                            <span className="text-[10px] font-bold text-slate-300">#{plan.ticker}</span>
+                          </div>
+                          <h3 className="font-bold text-lg mb-1 group-hover:text-rose-400 transition-colors">{plan.title}</h3>
+                          <p className="text-xs text-slate-400 italic line-clamp-1 mb-3">“{plan.hypothesis}”</p>
+                          <div className="flex gap-4">
+                             <div className="flex flex-col">
+                               <span className="text-[8px] font-bold text-slate-300 uppercase">Risk (止损)</span>
+                               <span className="text-sm font-bold text-rose-400 font-mono">{plan.stopLossPrice}</span>
+                             </div>
+                             <div className="flex flex-col">
+                               <span className="text-[8px] font-bold text-slate-300 uppercase">Target (预期)</span>
+                               <span className="text-sm font-bold text-emerald-400 font-mono">{plan.takeProfitPrice}</span>
+                             </div>
+                          </div>
+                        </div>
+                        <ChevronRight className="text-slate-200 mt-8" />
+                      </div>
+                    </GlassCard>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+
+        {view === 'forge' && (
+          <div className="space-y-6 animate-in zoom-in-95 duration-300">
+            <div className="flex justify-between items-center px-2">
+              <h2 className="text-2xl font-game font-bold text-slate-700">新决策锻造</h2>
+              <span className="text-[10px] font-bold text-slate-300 bg-slate-100 px-3 py-1 rounded-full uppercase">Step {currentStep}/3</span>
+            </div>
+            
+            <GlassCard className="space-y-6">
+              {currentStep === 1 && (
+                <div className="animate-in slide-in-from-right-4">
+                  <StepLabel num={1} text="输入核心驱动力" icon={Zap} />
+                  <div className="space-y-6">
+                    <div>
+                      <label className="text-[10px] font-bold text-rose-400 mb-3 block uppercase tracking-widest">选择核心决策变量</label>
+                      <div className="grid grid-cols-2 gap-3">
+                        {Object.values(MainVariable).map(v => (
+                          <button
+                            key={v}
+                            onClick={() => setForgeData({...forgeData, variable: v})}
+                            className={`p-4 rounded-[1.5rem] text-xs font-bold transition-all border-2 ${
+                              forgeData.variable === v 
+                                ? 'bg-rose-50 border-rose-100 text-rose-500 shadow-inner' 
+                                : 'bg-slate-50 border-transparent text-slate-400'
+                            }`}
+                          >
+                            {v}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="bg-slate-50 p-5 rounded-[2rem] border border-slate-100 relative">
+                      <div className="flex justify-between items-center mb-3">
+                        <label className="text-[10px] font-bold text-slate-400 block uppercase tracking-widest">核心交易假设 (必填)</label>
+                        <div className="flex flex-wrap gap-1 justify-end max-w-[200px]">
+                          {HYPOTHESIS_TEMPLATES.map(t => (
+                            <TemplateChip key={t.name} label={t.name} onClick={() => setForgeData({...forgeData, hypothesis: t.text})} />
+                          ))}
+                        </div>
+                      </div>
+                      <textarea 
+                        className="w-full bg-transparent p-0 outline-none h-28 text-slate-700 placeholder:text-slate-300 text-sm leading-relaxed resize-none" 
+                        placeholder="如果...那么... (例如：如果财报超预期，且突破200日均线，那么看多到...)" 
+                        value={forgeData.hypothesis} 
+                        onChange={e => setForgeData({...forgeData, hypothesis: e.target.value})} 
+                      />
+                      <button 
+                        onClick={handleCritique}
+                        disabled={isCritiquing || !forgeData.hypothesis}
+                        className="absolute bottom-4 right-4 bg-white shadow-sm border border-slate-100 p-2 rounded-xl text-blue-400 flex items-center gap-2 text-[10px] font-bold hover:bg-blue-50 transition-colors disabled:opacity-30"
+                      >
+                        {isCritiquing ? <Sparkles className="animate-spin" size={12}/> : <Brain size={12}/>} 老兵过目
+                      </button>
+                    </div>
+
+                    {critique && (
+                      <div className="p-4 bg-blue-50/50 rounded-2xl border border-blue-100 animate-in fade-in slide-in-from-top-2">
+                        <p className="text-[10px] font-bold text-blue-400 mb-1 uppercase tracking-tighter">老兵审计报告：</p>
+                        <p className="text-xs text-slate-600 leading-relaxed italic">“{critique}”</p>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <input className="bg-slate-50 p-4 rounded-2xl outline-none text-sm font-mono" placeholder="标的代码 (NVDA)" value={forgeData.ticker} onChange={e => setForgeData({...forgeData, ticker: e.target.value})} />
+                      <input className="bg-slate-50 p-4 rounded-2xl outline-none text-sm" placeholder="简短标题" value={forgeData.title} onChange={e => setForgeData({...forgeData, title: e.target.value})} />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {currentStep === 2 && (
+                <div className="animate-in slide-in-from-right-4">
+                  <StepLabel num={2} text="设置生死线" icon={Shield} />
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-3">
+                        <label className="text-[10px] font-bold text-rose-400 flex items-center gap-1 uppercase tracking-widest"><Shield size={10}/> 强制止损逻辑</label>
+                        <div className="flex flex-wrap gap-1">
+                          {EXIT_LOGIC_TEMPLATES.sl.map(t => (
+                            <TemplateChip key={t} label={t} onClick={() => setForgeData({...forgeData, stopLossPrice: t})} active={forgeData.stopLossPrice === t} />
+                          ))}
+                        </div>
+                        <input className="w-full bg-slate-50 p-4 rounded-2xl outline-none text-sm font-mono border border-transparent focus:border-rose-100" placeholder="点位或逻辑..." value={forgeData.stopLossPrice} onChange={e => setForgeData({...forgeData, stopLossPrice: e.target.value})} />
+                      </div>
+                      <div className="space-y-3">
+                        <label className="text-[10px] font-bold text-emerald-400 flex items-center gap-1 uppercase tracking-widest"><Target size={10}/> 预期离场逻辑</label>
+                        <div className="flex flex-wrap gap-1">
+                          {EXIT_LOGIC_TEMPLATES.tp.map(t => (
+                            <TemplateChip key={t} label={t} onClick={() => setForgeData({...forgeData, takeProfitPrice: t})} active={forgeData.takeProfitPrice === t} />
+                          ))}
+                        </div>
+                        <input className="w-full bg-slate-50 p-4 rounded-2xl outline-none text-sm font-mono border border-transparent focus:border-emerald-100" placeholder="点位或逻辑..." value={forgeData.takeProfitPrice} onChange={e => setForgeData({...forgeData, takeProfitPrice: e.target.value})} />
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      <label className="text-[10px] font-bold text-slate-400 block uppercase tracking-widest">预设风险报酬比</label>
+                      <div className="flex flex-wrap gap-2">
+                        {RR_TEMPLATES.map(t => (
+                          <TemplateChip key={t} label={t} onClick={() => setForgeData({...forgeData, riskRewardRatio: t})} active={forgeData.riskRewardRatio === t} />
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-400 mb-3 block uppercase tracking-widest">信心级别与仓位权重</label>
+                      <div className="flex gap-2">
+                        {Object.values(ConvictionLevel).map(v => (
+                          <button
+                            key={v}
+                            onClick={() => setForgeData({...forgeData, level: v})}
+                            className={`flex-1 p-3 rounded-xl text-[10px] font-bold transition-all border ${
+                              forgeData.level === v ? 'bg-slate-800 text-white' : 'bg-slate-50 border-transparent text-slate-400'
+                            }`}
+                          >
+                            {v}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {currentStep === 3 && (
+                <div className="animate-in slide-in-from-right-4">
+                  <StepLabel num={3} text="执行战术 (分批入场)" icon={Layers} />
+                  <div className="space-y-4">
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">入场步骤设置</p>
+                    <div className="space-y-3">
+                      {forgeData.entrySteps?.map((step, idx) => (
+                        <div key={idx} className="flex items-center gap-3 p-4 bg-slate-50 rounded-2xl border border-slate-100 group animate-in slide-in-from-bottom-2">
+                          <div className="flex-1 space-y-2">
+                             <div className="flex items-center gap-2">
+                               <input 
+                                 className="bg-white border border-slate-200 px-3 py-1 rounded-lg text-xs font-mono w-24 outline-none focus:border-pink-300"
+                                 placeholder="入场价格"
+                                 value={step.price}
+                                 onChange={e => updateEntryStep(idx, 'price', e.target.value)}
+                               />
+                               <input 
+                                 className="bg-white border border-slate-200 px-3 py-1 rounded-lg text-xs font-mono w-20 outline-none focus:border-pink-300"
+                                 placeholder="仓位%"
+                                 value={step.position}
+                                 onChange={e => updateEntryStep(idx, 'position', e.target.value)}
+                               />
+                             </div>
+                             <input 
+                               className="bg-white border border-slate-200 px-3 py-1 rounded-lg text-[10px] w-full outline-none focus:border-pink-300"
+                               placeholder="执行动作 (如：突破后买入)"
+                               value={step.action}
+                               onChange={e => updateEntryStep(idx, 'action', e.target.value)}
+                             />
+                          </div>
+                          <button 
+                            onClick={() => removeEntryStep(idx)}
+                            className="p-2 text-slate-300 hover:text-rose-400 transition-colors opacity-0 group-hover:opacity-100 disabled:opacity-0"
+                            disabled={(forgeData.entrySteps?.length || 0) <= 1}
+                          >
+                            <X size={16} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                    <button 
+                      onClick={addEntryStep}
+                      className="w-full py-3 border-2 border-dashed border-slate-100 rounded-2xl text-[10px] font-bold text-slate-400 flex items-center justify-center gap-2 hover:bg-slate-50 transition-colors"
+                    >
+                      <Plus size={14} /> 添加交易步骤
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex gap-4 pt-4">
+                {currentStep > 1 && (
+                  <button onClick={() => setCurrentStep(currentStep-1)} className="flex-1 py-4 text-slate-400 font-bold hover:text-slate-600">返回</button>
+                )}
+                <PrimaryButton className="flex-1 shadow-rose-100" onClick={() => currentStep < 3 ? setCurrentStep(currentStep+1) : savePlan()} disabled={currentStep === 1 && (!forgeData.hypothesis || !forgeData.ticker)}>
+                  {currentStep < 3 ? '继续细化' : '发布策略'}
+                </PrimaryButton>
+              </div>
+            </GlassCard>
+          </div>
+        )}
+
+        {view === 'battle' && selectedPlan && (
+          <div className="space-y-6 animate-in slide-in-from-right-4 duration-300">
+            <div className="flex items-center justify-between px-2">
+               <h2 className="text-2xl font-game font-bold text-slate-700">正在执行逻辑...</h2>
+               <button onClick={() => setView('home')} className="p-2 text-slate-400 hover:text-rose-400 transition-colors">
+                 <History size={20}/>
+               </button>
+            </div>
+            
+            <GlassCard className="space-y-8 relative overflow-hidden">
+              <div className="absolute top-0 right-0 p-10 opacity-[0.03] pointer-events-none">
+                <Shield size={200} />
+              </div>
+
+              <div className="border-b border-slate-50 pb-6">
+                 <div className="flex items-center gap-2 mb-3">
+                   <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
+                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em]">{selectedPlan.ticker} 战斗中</span>
+                 </div>
+                 <h3 className="text-2xl font-bold text-slate-800 mb-4">{selectedPlan.title}</h3>
+                 
+                 <div className="bg-slate-800 p-6 rounded-[2rem] text-slate-100 shadow-xl">
+                   <p className="text-[10px] font-bold text-slate-400 mb-3 uppercase tracking-widest flex items-center gap-2">
+                     <Fingerprint size={12}/> 初始交易假设
+                   </p>
+                   <p className="text-sm leading-relaxed italic">“{selectedPlan.hypothesis}”</p>
+                 </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-6">
+                <div className="space-y-1">
+                  <p className="text-[10px] text-rose-400 font-bold uppercase tracking-widest">止损点位/逻辑</p>
+                  <p className="text-xl font-bold font-mono text-rose-500">{selectedPlan.stopLossPrice}</p>
+                </div>
+                <div className="space-y-1 text-right">
+                  <p className="text-[10px] text-emerald-400 font-bold uppercase tracking-widest">止盈点位/逻辑</p>
+                  <p className="text-xl font-bold font-mono text-emerald-500">{selectedPlan.takeProfitPrice}</p>
+                </div>
+              </div>
+
+              <div className="p-5 bg-amber-50 rounded-2xl border border-amber-100/50 flex gap-4">
+                <ShieldAlert className="text-amber-500 shrink-0" size={20} />
+                <div className="space-y-1">
+                  <p className="text-[10px] font-bold text-amber-700 uppercase">纪律官红线：</p>
+                  <p className="text-xs text-amber-600/80 leading-relaxed font-medium">
+                    基于你的“{selectedPlan.variable}”变量：除非逻辑点发生根本性逆转，否则严禁在战斗中随意调整止损策略。
+                  </p>
+                </div>
+              </div>
+
+              <PrimaryButton className="w-full !from-slate-700 !to-slate-900 shadow-slate-200" onClick={() => setView('review')}>
+                交易结束 (进入复盘)
+              </PrimaryButton>
+            </GlassCard>
+          </div>
+        )}
+
+        {view === 'review' && selectedPlan && (
+          <div className="space-y-6 animate-in zoom-in-95 duration-300">
+            <h2 className="text-2xl font-game font-bold text-center text-slate-700">智慧复盘 Harvest</h2>
+            <GlassCard className="space-y-6">
+              <div className="bg-slate-50 p-5 rounded-2xl border border-slate-100">
+                <p className="text-[10px] text-slate-400 font-bold mb-2 uppercase">当初逻辑回顾</p>
+                <p className="text-xs text-slate-500 italic">“{selectedPlan.hypothesis}”</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                 <div className="col-span-2">
+                    <label className="block text-[10px] font-bold text-slate-400 mb-2 uppercase">最终盈亏幅度 (%)</label>
+                    <input type="number" className="w-full bg-slate-50 p-4 rounded-2xl outline-none font-mono text-lg border border-transparent focus:border-rose-100" placeholder="10.0" onChange={e => setReviewData({...reviewData, pnl: parseFloat(e.target.value)})} />
+                 </div>
+                 <div>
+                    <label className="block text-[10px] font-bold text-emerald-400 mb-2 uppercase flex items-center gap-1"><TrendingUp size={10}/> 过程最高点 (%)</label>
+                    <input type="number" className="w-full bg-slate-50 p-4 rounded-2xl outline-none font-mono text-sm border border-transparent focus:border-emerald-100" placeholder="0" onChange={e => setReviewData({...reviewData, maxProfit: parseFloat(e.target.value)})} />
+                 </div>
+                 <div>
+                    <label className="block text-[10px] font-bold text-rose-400 mb-2 uppercase flex items-center gap-1"><TrendingDown size={10}/> 过程最低点 (%)</label>
+                    <input type="number" className="w-full bg-slate-50 p-4 rounded-2xl outline-none font-mono text-sm border border-transparent focus:border-rose-100" placeholder="0" onChange={e => setReviewData({...reviewData, maxDrawdown: parseFloat(e.target.value)})} />
+                 </div>
+                 <div className="col-span-2">
+                    <label className="block text-[10px] font-bold text-slate-400 mb-2 uppercase">纪律执行分 ({reviewData.discipline})</label>
+                    <input type="range" className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-slate-800" min="0" max="100" value={reviewData.discipline} onChange={e => setReviewData({...reviewData, discipline: parseInt(e.target.value)})} />
+                 </div>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-slate-400 mb-2 uppercase">失败/成功的最关键因素</label>
+                <textarea className="w-full bg-slate-50 p-4 rounded-2xl outline-none h-28 text-sm leading-relaxed border border-transparent focus:border-slate-100" placeholder="是什么导致了这种结果？" onChange={e => setReviewData({...reviewData, notes: e.target.value})} />
+              </div>
+
+              <PrimaryButton className="w-full" onClick={finishTrade} disabled={isProcessing}>
+                {isProcessing ? "Gemini 老兵正在解剖细节..." : "入库历史记录"}
+              </PrimaryButton>
+            </GlassCard>
+          </div>
+        )}
+
+        {view === 'archive' && (
+          <div className="space-y-6 animate-in fade-in duration-500">
+            <h2 className="text-xl font-bold flex items-center gap-2 px-2 text-slate-600"><History size={20} /> 历史博弈档案馆</h2>
+            {historyPlans.length === 0 ? (
+               <div className="text-center py-20 bg-white/40 border-2 border-dashed border-slate-100 rounded-[3rem]">
+                 <p className="text-slate-300 text-sm">还没有战绩，去开启第一场战斗吧。</p>
+               </div>
+            ) : (
+              <div className="space-y-6">
+                {historyPlans.map(plan => (
+                  <GlassCard key={plan.id} className="relative overflow-hidden group border-slate-50">
+                    <div className={`absolute top-0 right-0 px-6 py-2 rounded-bl-[2rem] font-bold text-sm shadow-sm z-10 ${plan.pnl && plan.pnl > 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
+                      {(plan.pnl || 0) > 0 ? '+' : ''}{plan.pnl}%
+                    </div>
+                    
+                    <div className="mb-4 pr-16">
+                       <p className="text-[10px] font-bold text-slate-300 mb-1">#{plan.ticker} | {plan.variable}</p>
+                       <h3 className="font-bold text-lg text-slate-700">{plan.title}</h3>
+                    </div>
+
+                    <div className="mb-4 bg-slate-50/50 rounded-3xl p-4 border border-slate-50">
+                       <div className="flex justify-between items-center mb-2">
+                         <span className="text-[8px] font-bold text-slate-400 uppercase tracking-widest flex items-center gap-1"><BarChart3 size={10}/> 盈亏轨迹</span>
+                         <div className="flex gap-2">
+                            <span className="text-[8px] text-emerald-500 font-bold">Max: {plan.maxProfit}%</span>
+                            <span className="text-[8px] text-rose-500 font-bold">Min: {plan.maxDrawdown}%</span>
+                         </div>
+                       </div>
+                       <TradeSparkline pnl={plan.pnl || 0} maxProfit={plan.maxProfit} maxDrawdown={plan.maxDrawdown} />
+                    </div>
+
+                    {plan.aiAnalysis && (
+                      <div className="bg-white p-5 rounded-2xl border border-slate-100 relative mb-4 shadow-sm">
+                         <div className="flex items-center gap-2 mb-3">
+                           <Brain size={16} className="text-blue-400" />
+                           <span className="text-[10px] font-bold text-blue-400 uppercase tracking-widest">Gemini 老兵分析</span>
+                         </div>
+                         <p className="text-xs text-slate-600 leading-relaxed italic font-medium">“{plan.aiAnalysis}”</p>
+                      </div>
+                    )}
+
+                    <div className="flex justify-between items-center text-[10px] text-slate-300 border-t border-slate-50 pt-4 mt-4">
+                       <span className="flex items-center gap-1"><Scale size={10}/> 纪律执行: {plan.disciplineScore}分</span>
+                       <button onClick={() => setPlans(plans.filter(p => p.id !== plan.id))} className="p-2 hover:text-rose-400 transition-colors opacity-0 group-hover:opacity-100">
+                         <Trash2 size={16}/>
+                       </button>
+                    </div>
+                  </GlassCard>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {view === 'mentor' && (
+          <div className="space-y-6 animate-in slide-in-from-left-4 duration-300">
+             <h2 className="text-2xl font-game font-bold text-center text-slate-700">老兵密室</h2>
+             <GlassCard className="bg-gradient-to-br from-slate-900 to-slate-800 text-slate-100 relative overflow-hidden">
+                <div className="absolute -bottom-10 -right-10 opacity-10 rotate-12">
+                  <Brain size={200} />
+                </div>
+                
+                <div className="flex flex-col items-center mb-8 relative">
+                   <div className="w-20 h-20 bg-white/10 backdrop-blur-md rounded-[2.5rem] flex items-center justify-center shadow-2xl mb-6 border border-white/20">
+                      <MessageCircle size={32} className="text-pink-300" />
+                   </div>
+                   <p className="text-sm text-center text-slate-300 px-6 leading-relaxed italic">
+                     “投资中最大的敌人是你的情绪。Google Gemini 已经准备好给你最中肯的建议。”
+                   </p>
+                </div>
+
+                <div className="mb-4 bg-white/5 p-3 rounded-xl border border-white/10 flex items-center gap-3">
+                  <LinkIcon size={14} className="text-pink-300" />
+                  <p className="text-[10px] text-slate-400 font-bold uppercase tracking-tight">
+                    已关联历史档案：{historyPlans.length} 笔历史交易
+                  </p>
+                </div>
+                
+                <div className="space-y-5 relative">
+                  <textarea 
+                    className="w-full bg-white/5
